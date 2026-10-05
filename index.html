@@ -195,6 +195,15 @@
   li a .tldrow { display:flex; align-items:center; gap:6px; }
   li a .tld { color:var(--dim); }
   li a .x { color:var(--red); font-weight:700; flex:none; }
+  li .xtog { flex:none; font-family:inherit; font-weight:700; font-size:10px; color:var(--red);
+    background:var(--panel); border:1.5px solid var(--rule); border-radius:2px; padding:5px 6px; cursor:pointer; }
+  li .xtog.on { background:var(--red); color:var(--paper); }
+  li.sib { padding-left:18px; }
+  li.sib .age { min-width:28px; }
+  li.xrow { padding:6px 0 8px 18px; font-size:11px; color:var(--dim); gap:10px; }
+  li .xcheck { font-family:inherit; font-weight:700; font-size:11px; color:var(--ink);
+    background:var(--panel); border:1.5px solid var(--rule); border-radius:2px; padding:7px 10px; cursor:pointer; }
+  li .xnote { color:var(--dim); }
   li .cat { flex:none; font-family:inherit; font-size:10px; letter-spacing:.03em; color:var(--ink);
     background:var(--panel); border:1.5px solid var(--rule); border-radius:2px; padding:3px 5px; max-width:104px; }
   .filters { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 10px; }
@@ -1003,6 +1012,69 @@ function renderChips() {
   if (typeof fillKeepCat === "function") fillKeepCat(); // RED PHONE: keep picker tracks CATLIST
 }
 
+// RED PHONE: cross-platform grouping helpers -----------------------
+const EXPANDED = new Set();   // RED PHONE: group keys the user has opened
+const CROSS = {};             // RED PHONE: key -> "checking" | "none" | "found"
+function subOf(u) { return u.replace(/^https?:\/\//, "").split("/")[0].replace(SUFFIX_RE, "").toLowerCase(); }
+// RED PHONE: one kept-hit row; sibling rows sit indented under their group
+function buildRow(u, tog, sib) {
+  const li = document.createElement("li");
+  if (sib) li.className = "sib";
+  // RED PHONE: left age stamp -> time since last human visit
+  const age = document.createElement("span");
+  age.className = "age";
+  const lbl = ageLabel(u);
+  age.textContent = lbl || "\u2013"; // RED PHONE: neutral dash until a human opens it
+  const days = (lbl.endsWith("d")) ? parseInt(lbl, 10) : 0;
+  if (days >= 99) age.classList.add("old");      // RED PHONE: capped + red
+  else if (days >= 30) age.classList.add("warn"); // RED PHONE: getting stale
+  const a = document.createElement("a");
+  a.href = u; a.target = "_blank"; a.rel = "noopener";
+  // RED PHONE: subdomain on top, platform suffix faint gray below
+  const host = u.replace(/^https?:\/\//, "");
+  const m = host.match(SUFFIX_RE);
+  const tld = m ? m[0] : "";
+  const sub = tld ? host.slice(0, host.length - tld.length) : host;
+  a.innerHTML = '<span class="sub">' + escHtml(sub) + '</span>' +
+    '<span class="tldrow"><span class="tld">' + escHtml(tld) + '</span><span class="x">&#8599;</span></span>';
+  a.addEventListener("click", () => { markVisited(u); setTimeout(render, 60); }); // RED PHONE: log the visit, refresh age
+  // RED PHONE: per-row category picker -> reassign on change
+  const sel = document.createElement("select");
+  sel.className = "cat";
+  for (const c of CATLIST) {
+    const o = document.createElement("option");
+    o.value = c; o.textContent = c; if (c === catOf(u)) o.selected = true;
+    sel.appendChild(o);
+  }
+  sel.onchange = () => { setCat(u, sel.value); render(); pushCloud([u]); }; // RED PHONE: sync the label change
+  li.appendChild(age);
+  li.appendChild(a);
+  if (tog) li.appendChild(tog);
+  li.appendChild(sel);
+  return li;
+}
+// RED PHONE: test this name on every platform it is not yet kept on, via
+//   /api/live (real 2xx only). Live ones join the corpus with the same label.
+//   No visit stamp: their age stays a dash until a human opens them.
+async function crossCheck(key, cat) {
+  if (!key || CROSS[key] === "checking") return;
+  const have = new Set(HITS.filter(u => subOf(u) === key).map(u => u.replace(/^https?:\/\//, "").split("/")[0].toLowerCase()));
+  const tries = PLATFORMS.map(p => key + "." + p.suffix).filter(h => !have.has(h) && !isBanned(h));
+  if (!tries.length) return;
+  CROSS[key] = "checking"; render();
+  const found = [];
+  for (const h of tries) {
+    try {
+      const r = await fetch("/api/live?host=" + encodeURIComponent(h));
+      const j = await r.json();
+      if (j && j.live) found.push("https://" + h);
+    } catch { /* endpoint unreachable -> treat as not found */ }
+  }
+  CROSS[key] = found.length ? "found" : "none";
+  for (const u of found) setCat(u, cat || guessCat(u));
+  if (found.length) { EXPANDED.add(key); pushCloud(found); } else render();
+}
+
 function render() {
   renderChips();
   const all = load();
@@ -1011,49 +1083,53 @@ function render() {
   const ul = document.getElementById("hits");
   document.getElementById("empty").style.display = all.length ? "none" : "block";
 
-  // RED PHONE: clamp page to range, then slice to the current 30
-  const pages = Math.max(1, Math.ceil(list.length / PER_PAGE));
+  // RED PHONE: group hits by subdomain across platforms (elgoog on vercel,
+  //   pages.dev, netlify = one group). Most recently human-visited sits on top.
+  const groups = []; const gidx = {};
+  for (const u of list) {
+    const k = subOf(u);
+    if (!(k in gidx)) { gidx[k] = groups.length; groups.push({ key: k, urls: [] }); }
+    groups[gidx[k]].urls.push(u);
+  }
+  for (const g of groups) g.urls.sort((x, y) => (VISITED[y] || 0) - (VISITED[x] || 0));
+
+  // RED PHONE: clamp page to range, then slice to the current 30 groups
+  const pages = Math.max(1, Math.ceil(groups.length / PER_PAGE));
   if (page >= pages) page = pages - 1;
   if (page < 0) page = 0;
   const start = page * PER_PAGE;
-  const slice = list.slice(start, start + PER_PAGE);
+  const slice = groups.slice(start, start + PER_PAGE);
 
   ul.innerHTML = "";
-  for (const u of slice) {
+  for (const g of slice) {
+    const all3 = HITS.filter(u => subOf(u) === g.key); // RED PHONE: every platform this name is on
+    const open = EXPANDED.has(g.key);
+    const tog = document.createElement("button");
+    tog.className = "xtog" + (open ? " on" : "");
+    tog.textContent = all3.length + "/" + PLATFORMS.length; // RED PHONE: platforms found for this name
+    tog.title = "other platforms";
+    tog.onclick = () => { if (open) EXPANDED.delete(g.key); else EXPANDED.add(g.key); render(); };
+    ul.appendChild(buildRow(g.urls[0], tog, false));
+    if (!open) continue;
+    for (const u of g.urls.slice(1)) ul.appendChild(buildRow(u, null, true));
+    // RED PHONE: expanded group footer -> check the remaining platforms for this name
     const li = document.createElement("li");
-    // RED PHONE: left age stamp (replaces the old carrot) -> time since last visit
-    const age = document.createElement("span");
-    age.className = "age";
-    const lbl = ageLabel(u);
-    age.textContent = lbl || "\u2013"; // RED PHONE: neutral dash until a human opens it
-    const days = (lbl.endsWith("d")) ? parseInt(lbl, 10) : 0;
-    if (days >= 99) age.classList.add("old");      // RED PHONE: capped + red
-    else if (days >= 30) age.classList.add("warn"); // RED PHONE: getting stale
-    const a = document.createElement("a");
-    a.href = u; a.target = "_blank"; a.rel = "noopener";
-    // RED PHONE: subdomain on top, platform suffix (.vercel.app / .pages.dev) faint gray below
-    const host = u.replace(/^https?:\/\//, "");
-    const m = host.match(SUFFIX_RE);
-    const tld = m ? m[0] : "";
-    const sub = tld ? host.slice(0, host.length - tld.length) : host;
-    a.innerHTML = '<span class="sub">' + escHtml(sub) + '</span>' +
-      '<span class="tldrow"><span class="tld">' + escHtml(tld) + '</span><span class="x">&#8599;</span></span>';
-    a.addEventListener("click", () => { markVisited(u); setTimeout(render, 60); }); // RED PHONE: log the visit, refresh age
-    // RED PHONE: per-row category picker -> reassign on change
-    const sel = document.createElement("select");
-    sel.className = "cat";
-    for (const c of CATLIST) {
-      const o = document.createElement("option");
-      o.value = c; o.textContent = c; if (c === catOf(u)) o.selected = true;
-      sel.appendChild(o);
+    li.className = "xrow";
+    const st = CROSS[g.key];
+    if (all3.length >= PLATFORMS.length) {
+      li.textContent = "on every platform";
+    } else {
+      const b = document.createElement("button");
+      b.className = "xcheck";
+      b.disabled = st === "checking";
+      b.textContent = st === "checking" ? "checking\u2026" : "\u21c4 check other platforms";
+      b.onclick = () => crossCheck(g.key, catOf(g.urls[0]));
+      li.appendChild(b);
+      if (st === "none") { const n = document.createElement("span"); n.className = "xnote"; n.textContent = "none found"; li.appendChild(n); }
     }
-    sel.onchange = () => { setCat(u, sel.value); render(); pushCloud([u]); }; // RED PHONE: sync the label change
-    li.appendChild(age);
-    li.appendChild(a);
-    li.appendChild(sel);
     ul.appendChild(li);
   }
-  renderPager(list.length, pages);
+  renderPager(groups.length, pages);
   // RED PHONE: HUD stat line, game-style
   const hud = document.getElementById("hud");
   if (hud) {
@@ -1088,6 +1164,7 @@ function addToHits(u, cat) {
   setCat(u, cat || guessCat(u)); // RED PHONE: shape-based tag before syncing
   markVisited(u);                // RED PHONE: discovered/checked now
   pushCloud([u]); // RED PHONE: local + cloud
+  crossCheck(subOf(u), catOf(u)); // RED PHONE: look for the same name on other platforms
 }
 
 // RED PHONE: mode tabs ---------------------------------------------
@@ -1445,7 +1522,7 @@ if (resortVer !== RESORT_VER) {
 }
 setMode(mode);
 // RED PHONE: version tag
-const APP_VERSION = "3.9";
+const APP_VERSION = "4.0";
 const verEl = document.getElementById("ver"); if (verEl) verEl.textContent = "v" + APP_VERSION;
 // RED PHONE: NO baseline stamp. Age is set ONLY by a real human tap. Unvisited
 //   urls show a neutral dash until someone actually opens them.
